@@ -60,7 +60,7 @@ void InputsEmbedder::IInputsEmbedder::update_chat_history(const std::string& dec
         m_kv_cache_state.reset_mem_state = state.empty();
     } else {
         // Tail of chat template is missing in KV cache.
-        // Find the tail to concatenate it with the next input prompt.
+        // Find the tail to concatenate it with the next input prompt
         m_history.push_back({{"role", "assistant"}, {"content", decoded_results}});
     }
 }
@@ -188,9 +188,16 @@ std::vector<ov::Tensor> InputsEmbedder::IInputsEmbedder::to_single_image_tensors
 }
 
 std::vector<ov::genai::EncodedImage> InputsEmbedder::IInputsEmbedder::encode_images(const std::vector<ov::Tensor>& images) {
+    std::cout << "1.1 encode_images" << std::endl;
     std::vector<EncodedImage> embeds;
     std::vector<ov::Tensor> single_images = to_single_image_tensors(images);
+    std::cout << single_images.size() << " images" << std::endl;
     for (const ov::Tensor& image : single_images) {
+        std::cout << "Image tensor dimensions: ";
+        for (const auto& dim : image.get_shape()) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
         embeds.emplace_back(m_vision_encoder->encode(image));
     }
     return embeds;

@@ -7,6 +7,10 @@
 #include "load_image.hpp"
 #include <openvino/genai/visual_language/pipeline.hpp>
 
+auto streamer = [](std::string subword) {
+    std::cout << subword << std::flush;
+    return ov::genai::StreamingStatus::RUNNING;
+};
 
 int main(int argc, char* argv[]) try {
     cxxopts::Options options("benchmark_vlm", "Help command");
@@ -48,13 +52,19 @@ int main(int argc, char* argv[]) try {
 
     ov::genai::VLMPipeline pipe(models_path, device);
     
+    std::cout << "Warm up" << std::endl;
     for (size_t i = 0; i < num_warmup; i++)
         pipe.generate(prompt, ov::genai::image(image), ov::genai::generation_config(config));
     
     auto res = pipe.generate(prompt, ov::genai::image(image), ov::genai::generation_config(config));
     auto metrics = res.perf_metrics;
     for (size_t i = 0; i < num_iter - 1; i++) {
-        res = pipe.generate(prompt, ov::genai::image(image), ov::genai::generation_config(config));
+        std::cout << "Generate iter: " << i << std::endl;
+        if (i == num_iter - 2) {
+            res = pipe.generate(prompt, ov::genai::image(image), ov::genai::generation_config(config), ov::genai::streamer(streamer));
+        } else {
+            res = pipe.generate(prompt, ov::genai::image(image), ov::genai::generation_config(config));
+        }
         metrics = metrics + res.perf_metrics;
     }
 

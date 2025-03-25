@@ -280,12 +280,15 @@ ov::Tensor prepare_vis_position_ids(
 }
 
 EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const ov::Tensor& img, ov::InferRequest& encoder, int max_slice_nums, int scale_resolution, size_t patch_size, bool never_split) {
+    printf("llava_image_embed_make_with_bytes_slice: \n");
+    printf("max_slice_nums %d, scale_resolution %d, patch_size %u\n", max_slice_nums, scale_resolution, patch_size);
     clip_image_u8 source = tensor_to_clip_image_u8(img);
     std::vector<std::vector<clip_image_u8>> imgs = slice_image(source, max_slice_nums, scale_resolution, patch_size, never_split);
     std::vector<std::vector<ov::Tensor>> results;
     std::vector<std::vector<ImageSize>> sizes;
     const size_t channels = 3;
 
+    printf("Sliced imgs.size() %u\n", imgs.size());
     std::vector<std::vector<clip_image_f32>> preprocessed{imgs.size()};
     size_t max_h = 0, max_w = 0, n_images = 0, max_size = 0;
     std::transform(imgs.begin(), imgs.end(), preprocessed.begin(), [&ctx_clip, &max_h, &max_w, &max_size, &n_images](const std::vector<clip_image_u8>& row) {
@@ -311,8 +314,14 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
     clip_image_f32& resized_preprocessed = preprocessed.at(0).at(0);
     size_t img_h = resized_preprocessed.ny;
     size_t img_w = resized_preprocessed.nx;
+    printf("img_h: %u img_w: %u\n", img_h, img_w);
     ov::Tensor clip_img{ov::element::f32, {1, channels, img_h, img_w}, resized_preprocessed.buf.data()};
     ov::Tensor clip_pixel_values = preprocess_for_encoder(clip_img, patch_size);
+    std::cout << "clip_pixel_values tensor dimensions: ";
+    for (const auto& dim : clip_pixel_values.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
 
     float* clip_value_data = clip_pixel_values.data<float>();
     size_t batch_pixel = 1;
@@ -350,6 +359,11 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
         }
     }
     encoder.set_tensor("pixel_values", pixel_values);
+    std::cout << "pixel_values tensor dimensions: ";
+    for (const auto& dim : pixel_values.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
 
     ov::Tensor patch_attention_mask{ov::element::f32, {pixel_values.get_shape().at(0), 1, max_h / patch_size * max_w / patch_size}};
     float* attention_data = patch_attention_mask.data<float>();
@@ -365,6 +379,11 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
         }
     }
     encoder.set_tensor("patch_attention_mask", patch_attention_mask);
+    std::cout << "patch_attention_mask tensor dimensions: ";
+    for (const auto& dim : patch_attention_mask.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
 
     ImageSize resized_source_size{resized_preprocessed.ny / patch_size, resized_preprocessed.nx / patch_size};
     std::vector<ImageSize> tgt_sizes{resized_source_size};
@@ -377,9 +396,20 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
     }
     ov::Tensor position_ids = prepare_vis_position_ids(pixel_values, patch_attention_mask, tgt_sizes, patch_size, ctx_clip.image_size / patch_size);
     encoder.set_tensor("position_ids", position_ids);
+    std::cout << "position_ids tensor dimensions: ";
+    for (const auto& dim : position_ids.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
     encoder.start_async();
     encoder.wait();
     const ov::Tensor& output_tensor = encoder.get_output_tensor();
+
+    std::cout << "visual output_tensor dimensions: ";
+    for (const auto& dim : output_tensor.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
 
     if (1 == preprocessed.size()) {
         ov::Tensor resized_source{ov::element::f32, output_tensor.get_shape()};
@@ -582,6 +612,7 @@ InputsEmbedderMiniCPM::InputsEmbedderMiniCPM(
 }
 
 ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics) {
+    std::cout << "1.2 unify_prompt" << std::endl;
     auto [unified_prompt, images_sequence] = unify_prompt(
         prompt,
         NATIVE_TAG,
@@ -589,6 +620,9 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
         images.size(),
         m_image_id
     );
+
+    std::cout << "prompt: " << prompt << std::endl;
+    std::cout << "unified_prompt: " << unified_prompt << std::endl;
 
     std::string unk64;
     for (size_t idx = 0; idx < m_vlm_config.query_num; ++idx) {
@@ -614,15 +648,32 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
         }
         unified_prompt.replace(unified_prompt.find(NATIVE_TAG), NATIVE_TAG.length(), expanded_tag);
     }
+
+    std::cout << "unified_prompt2: " << unified_prompt << std::endl;
+
     m_image_id = images_sequence.empty() ? m_image_id : *std::max_element(images_sequence.begin(), images_sequence.end()) + 1;
 
+    // tokenizer encodes unified_prompt
+    std::cout << "1.3 unify_prompt tokenize" << std::endl;
     ov::Tensor encoded_input = get_encoded_input_ids(unified_prompt, metrics);
-
+    std::cout << "Prompt enc input dimensions: ";
+    for (const auto& dim : encoded_input.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
+    // prompt enc
+    std::cout << "1.4 infer model for prompt embedding" << std::endl;
     ov::Tensor inputs_embeds = m_embedding->infer(encoded_input);
     OPENVINO_ASSERT(
         m_vlm_config.hidden_size == inputs_embeds.get_shape().at(2),
         "Unexpected embedding size"
     );
+    std::cout << "Prompt enc output dimensions: ";
+    for (const auto& dim : inputs_embeds.get_shape()) {
+        std::cout << dim << " ";
+    }
+    std::cout << std::endl;
+    std::cout << "1.5 Special tokenizer" << std::endl;
     auto start_tokenizer_time = std::chrono::steady_clock::now();
     ov::Tensor special_tokens = m_tokenizer.encode(
         m_vlm_config.im_start
@@ -637,6 +688,8 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
         4 == special_tokens.get_shape().at(1),
         "Every special token must be represented with a single int."
     );
+
+    std::cout << "1.6 resample and connect embedding" << std::endl;
     int64_t im_start_id = special_tokens.data<int64_t>()[0];
     int64_t im_end_id = special_tokens.data<int64_t>()[1];
     int64_t slice_start_id = special_tokens.data<int64_t>()[2];
@@ -678,6 +731,11 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
     if (!m_is_chat_conversation) {
         m_image_id = 0;
         m_prev_image_id = 0;
+    }
+
+    std::cout << "Resample output dimensions: ";
+    for (const auto& dim : inputs_embeds.get_shape()) {
+        std::cout << dim << " ";
     }
     return inputs_embeds;
 }

@@ -70,6 +70,7 @@ public:
         auto device_propertes = utils::pop_or_default<ov::AnyMap>(
             properties_copy, ov::device::properties.name(), { }
         );
+
         // Otherwise, the same properties are used for all models and devices
         auto lm_properties = device_propertes.empty()
             ? properties_copy
@@ -80,9 +81,14 @@ public:
         if (m_is_npu) {
             embedder_device = "CPU";
             utils::KVDesc kv_desc;
+            std::cout << "Start compile lanuage model for npu" << '\n';
+            auto start_compile = std::chrono::steady_clock::now();
             std::tie(compiled_language_model, kv_desc) = utils::compile_decoder_for_npu(
                 language_model, lm_properties, kv_pos, language_model_path
             );
+            auto end_compile = std::chrono::steady_clock::now();
+            auto duration = PerfMetrics::get_microsec(end_compile - start_compile);
+            std::cout << "Compilation time: " << duration << " us" << '\n';
             m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
         } else {
             compiled_language_model = utils::singleton_core().compile_model(language_model, device, lm_properties);
@@ -181,6 +187,7 @@ public:
 
         m_inputs_embedder->set_apply_chat_template_status(generation_config.apply_chat_template);
 
+        std::cout << "1. inputs embedding for vision and prompt" << std::endl;
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
         ov::Tensor inputs_embeds = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, perf_metrics);
         auto end_get_inputs_embeds = std::chrono::steady_clock::now();
@@ -222,10 +229,12 @@ public:
             m_sampler.set_seed(generation_config.rng_seed);
         }
 
+        std::cout << "2. vlm infer" << std::endl;
         ov::genai::utils::GenerationFinishInfo finish_info = ov::genai::get_lm_encoded_results(m_language, inputs_embeds, new_atten_mask, streamer_ptr, m_sampler, requests,
                                                                                                position_ids, kv_cache_state, m_embedding, rope_delta, m_max_kv_cache_size);
         EncodedResults& encoded_result = finish_info.results;
 
+        std::cout << "3. de-tokenizer" << std::endl;
         auto decode_start_time = std::chrono::steady_clock::now();
         VLMDecodedResults decoded;
         for (size_t idx = 0; idx < encoded_result.tokens.size(); ++idx) {
@@ -242,6 +251,8 @@ public:
 
         auto generate_end_time = std::chrono::steady_clock::now();
         decoded.perf_metrics = encoded_result.perf_metrics;
+
+        std::cout << "4. done" << std::endl;
 
         // Common perf metrics
         auto& res_raw_counters = decoded.perf_metrics.raw_metrics;
