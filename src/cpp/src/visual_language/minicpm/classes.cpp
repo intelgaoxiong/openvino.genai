@@ -279,7 +279,43 @@ ov::Tensor prepare_vis_position_ids(
     return position_ids;
 }
 
-EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const ov::Tensor& img, ov::InferRequest& encoder, int max_slice_nums, int scale_resolution, size_t patch_size, bool never_split) {
+std::vector<ov::Tensor> split_tensor_into_batches(const ov::Tensor& tensor) {
+    auto shape = tensor.get_shape();
+
+    if (shape.empty() || shape[0] <= 1) {
+        throw std::invalid_argument("Tensor batch size must be greater than 1.");
+    }
+
+    size_t batch_size = shape[0];
+    std::vector<size_t> new_shape = shape;
+    new_shape[0] = 1;  // 设置 batch size 为 1
+
+    std::vector<ov::Tensor> batch_tensors;
+
+    for (size_t i = 0; i < batch_size; ++i) {
+        ov::Tensor batch_tensor(tensor.get_element_type(), new_shape);
+        std::memcpy(batch_tensor.data(), static_cast<const char*>(tensor.data()) + i * batch_tensor.get_byte_size(), batch_tensor.get_byte_size());
+        batch_tensors.push_back(batch_tensor);
+    }
+
+    return batch_tensors;
+}
+
+void save_tensor_to_binary_file(const ov::Tensor& tensor, const std::string& filename) {
+    std::ofstream outfile(filename, std::ios::binary);
+    if (!outfile.is_open()) {
+        throw std::runtime_error("Failed to open file for writing: " + filename);
+    }
+
+    const void* data_ptr = tensor.data();
+    size_t byte_size = tensor.get_byte_size();
+
+    outfile.write(static_cast<const char*>(data_ptr), byte_size);
+
+    outfile.close();
+}
+
+EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip, const ov::Tensor& img, ov::InferRequest& encoder, int max_slice_nums, int scale_resolution, size_t patch_size, bool never_split) {
     printf("llava_image_embed_make_with_bytes_slice: \n");
     printf("max_slice_nums %d, scale_resolution %d, patch_size %u\n", max_slice_nums, scale_resolution, patch_size);
     clip_image_u8 source = tensor_to_clip_image_u8(img);
@@ -358,12 +394,179 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
             }
         }
     }
-    encoder.set_tensor("pixel_values", pixel_values);
-    std::cout << "pixel_values tensor dimensions: ";
-    for (const auto& dim : pixel_values.get_shape()) {
+
+    ov::Tensor patch_attention_mask{ov::element::f32, {pixel_values.get_shape().at(0), 1, max_h / patch_size * max_w / patch_size}};
+    float* attention_data = patch_attention_mask.data<float>();
+    std::fill_n(attention_data, patch_attention_mask.get_size(), 0.0f);
+    std::fill_n(attention_data, resized_preprocessed.ny / patch_size * resized_preprocessed.nx / patch_size, 1.0f);
+    if (1 < preprocessed.size()) {
+        for (size_t row = 1; row < preprocessed.size(); ++row) {
+            size_t n_slices = preprocessed.at(row).size();
+            for (size_t col = 0; col < n_slices; ++col) {
+                const clip_image_f32& elem = preprocessed.at(row).at(col);
+                std::fill_n(attention_data + ((row - 1) * n_slices + col + 1) * max_h / patch_size * max_w / patch_size, elem.ny / patch_size * elem.nx / patch_size, 1.0f);
+            }
+        }
+    }
+
+    ImageSize resized_source_size{resized_preprocessed.ny / patch_size, resized_preprocessed.nx / patch_size};
+    std::vector<ImageSize> tgt_sizes{resized_source_size};
+    if (1 < preprocessed.size()) {
+        for (const std::vector<clip_image_f32>& row : preprocessed) {
+            for (const clip_image_f32& elem : row) {
+                tgt_sizes.push_back({elem.ny / patch_size, elem.nx / patch_size});
+            }
+        }
+    }
+    ov::Tensor position_ids = prepare_vis_position_ids(pixel_values, patch_attention_mask, tgt_sizes, patch_size, ctx_clip.image_size / patch_size);
+
+    auto batched_pixel_values = split_tensor_into_batches(pixel_values);
+    auto batched_patch_attention_mask = split_tensor_into_batches(patch_attention_mask);
+    auto batched_position_ids = split_tensor_into_batches(position_ids);
+
+    std::vector<ov::Tensor> output_tensors;
+    for (size_t i = 0; i < n_images; i ++) {
+        // Set tensors
+        encoder.set_tensor("pixel_values", batched_pixel_values[i]);
+        std::cout << "pixel_values tensor dimensions: ";
+        for (const auto& dim : batched_pixel_values[i].get_shape()) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
+
+        encoder.set_tensor("patch_attention_mask", batched_patch_attention_mask[i]);
+        std::cout << "patch_attention_mask tensor dimensions: ";
+        for (const auto& dim : batched_patch_attention_mask[i].get_shape()) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
+
+        encoder.set_tensor("position_ids", batched_position_ids[i]);
+        std::cout << "position_ids tensor dimensions: ";
+        for (const auto& dim : batched_position_ids[i].get_shape()) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
+        encoder.start_async();
+        encoder.wait();
+
+        auto output_tensor = encoder.get_output_tensor();
+        ov::Tensor tmpTensor{ov::element::f32, output_tensor.get_shape()};
+        output_tensor.copy_to(tmpTensor);
+
+        std::string file_name = "out_" + std::to_string(i);
+        save_tensor_to_binary_file(tmpTensor, file_name);
+
+        output_tensors.push_back(tmpTensor);
+    }
+
+    std::cout << "visual output_tensor dimensions: ";
+    for (const auto& dim : output_tensors[0].get_shape()) {
         std::cout << dim << " ";
     }
     std::cout << std::endl;
+
+    if (1 == output_tensors.size()) {
+        ov::Tensor resized_source{ov::element::f32, output_tensors[0].get_shape()};
+        output_tensors[0].copy_to(resized_source);
+        return {std::move(resized_source), resized_source_size};
+    }
+
+    size_t old_hidden_size = output_tensors[0].get_shape().at(2);
+    const float* out = output_tensors[0].data<float>();
+    ov::Tensor resized_source{ov::element::f32, {1, resized_source_size.height * resized_source_size.width, old_hidden_size}};
+    std::copy_n(out, resized_source.get_size(), resized_source.data<float>());
+
+    std::cout << "preprocessed.size() " << preprocessed.size() << std::endl;
+    for (size_t i = 0; i < preprocessed.size(); i ++) {
+        std::cout << i << " " << preprocessed.at(1).size() << std::endl;
+    }
+    size_t n_patches = tgt_sizes.at(1).height * tgt_sizes.at(1).width;
+    ov::Tensor encoded_slices{ov::element::f32, {preprocessed.size() - 1, preprocessed.at(1).size(), n_patches, old_hidden_size}};
+    for (size_t col = 0; col < preprocessed.size() - 1; ++col) {
+        for (size_t row = 0; row < preprocessed.at(1).size(); ++row) {
+            float* currOut = output_tensors[col + 1].data<float>();
+            std::cout << "id " << col + 1 << std::endl;
+            std::cout << "1 copy " << n_patches * old_hidden_size << std::endl;
+            std::copy_n(currOut, n_patches * old_hidden_size, encoded_slices.data<float>() + (col * preprocessed.at(1).size() + row) * n_patches * old_hidden_size);
+        }
+    }
+
+    save_tensor_to_binary_file(encoded_slices, "encoded_slices.bin");
+    return {resized_source, resized_source_size, encoded_slices, tgt_sizes.at(1)};
+}
+
+EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const ov::Tensor& img, ov::InferRequest& encoder, int max_slice_nums, int scale_resolution, size_t patch_size, bool never_split) {
+    clip_image_u8 source = tensor_to_clip_image_u8(img);
+    std::vector<std::vector<clip_image_u8>> imgs = slice_image(source, max_slice_nums, scale_resolution, patch_size, never_split);
+    std::vector<std::vector<ov::Tensor>> results;
+    std::vector<std::vector<ImageSize>> sizes;
+    const size_t channels = 3;
+
+    std::vector<std::vector<clip_image_f32>> preprocessed{imgs.size()};
+    size_t max_h = 0, max_w = 0, n_images = 0, max_size = 0;
+    std::transform(imgs.begin(), imgs.end(), preprocessed.begin(), [&ctx_clip, &max_h, &max_w, &max_size, &n_images](const std::vector<clip_image_u8>& row) {
+        std::vector<clip_image_f32> processed_row{row.size()};
+        std::transform(row.begin(), row.end(), processed_row.begin(), [&ctx_clip, &max_h, &max_w, &max_size, &n_images](const clip_image_u8& raw) {
+            clip_image_f32 im = clip_image_preprocess(ctx_clip, raw);
+            if (size_t(im.ny) * size_t(im.nx) > max_size) {
+                max_size = size_t(im.ny) * size_t(im.nx);
+                max_h = size_t(im.ny);
+                max_w = size_t(im.nx);
+            }
+            ++n_images;
+            return im;
+        });
+        return processed_row;
+    });
+
+    ov::Tensor pixel_values{ov::element::f32, {n_images, channels, patch_size, max_size / patch_size}};
+    size_t d3_all_pixel = pixel_values.get_shape().at(3);
+    float* pixel_value_data = pixel_values.data<float>();
+
+    //image chw to 1*c*kernel*hw/kernel and padding zero
+    clip_image_f32& resized_preprocessed = preprocessed.at(0).at(0);
+    size_t img_h = resized_preprocessed.ny;
+    size_t img_w = resized_preprocessed.nx;
+    ov::Tensor clip_img{ov::element::f32, {1, channels, img_h, img_w}, resized_preprocessed.buf.data()};
+    ov::Tensor clip_pixel_values = preprocess_for_encoder(clip_img, patch_size);
+
+    float* clip_value_data = clip_pixel_values.data<float>();
+    size_t batch_pixel = 1;
+    size_t d3_clip_pixel = clip_pixel_values.get_shape().at(3);
+    for (size_t c_idx = 0; c_idx < channels; ++c_idx) {
+        for (size_t k_idx = 0; k_idx < patch_size; k_idx++) {
+            std::copy(clip_value_data, clip_value_data + d3_clip_pixel, pixel_value_data);
+            clip_value_data += d3_clip_pixel;
+            pixel_value_data += d3_all_pixel;
+        }
+    }
+
+    if (1 < preprocessed.size()) {
+        for (size_t row = 1; row < preprocessed.size(); ++row) {
+            size_t n_slices = preprocessed.at(row).size();
+            for (size_t col = 0; col < n_slices; ++col) {
+                clip_image_f32& elem = preprocessed.at(row).at(col);
+                img_h = elem.ny;
+                img_w = elem.nx;
+                ov::Tensor clip_img{ov::element::f32, {1, channels, img_h, img_w}, elem.buf.data()};
+                ov::Tensor clip_pixel_values = preprocess_for_encoder(clip_img, patch_size);
+
+                d3_clip_pixel = clip_pixel_values.get_shape().at(3);
+                clip_value_data = clip_pixel_values.data<float>();
+                pixel_value_data = pixel_values.data<float>() + batch_pixel * channels * patch_size * d3_all_pixel;
+                for (size_t c_idx = 0; c_idx < channels; ++c_idx) {
+                    for (size_t k_idx = 0; k_idx < patch_size; k_idx++) {
+                        std::copy(clip_value_data, clip_value_data + d3_clip_pixel, pixel_value_data);
+                        clip_value_data += d3_clip_pixel;
+                        pixel_value_data += d3_all_pixel;
+                    }
+                }
+                batch_pixel++;
+            }
+        }
+    }
+    encoder.set_tensor("pixel_values", pixel_values);
 
     ov::Tensor patch_attention_mask{ov::element::f32, {pixel_values.get_shape().at(0), 1, max_h / patch_size * max_w / patch_size}};
     float* attention_data = patch_attention_mask.data<float>();
@@ -379,11 +582,6 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
         }
     }
     encoder.set_tensor("patch_attention_mask", patch_attention_mask);
-    std::cout << "patch_attention_mask tensor dimensions: ";
-    for (const auto& dim : patch_attention_mask.get_shape()) {
-        std::cout << dim << " ";
-    }
-    std::cout << std::endl;
 
     ImageSize resized_source_size{resized_preprocessed.ny / patch_size, resized_preprocessed.nx / patch_size};
     std::vector<ImageSize> tgt_sizes{resized_source_size};
@@ -396,20 +594,15 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
     }
     ov::Tensor position_ids = prepare_vis_position_ids(pixel_values, patch_attention_mask, tgt_sizes, patch_size, ctx_clip.image_size / patch_size);
     encoder.set_tensor("position_ids", position_ids);
-    std::cout << "position_ids tensor dimensions: ";
-    for (const auto& dim : position_ids.get_shape()) {
-        std::cout << dim << " ";
-    }
-    std::cout << std::endl;
     encoder.start_async();
     encoder.wait();
     const ov::Tensor& output_tensor = encoder.get_output_tensor();
 
-    std::cout << "visual output_tensor dimensions: ";
-    for (const auto& dim : output_tensor.get_shape()) {
-        std::cout << dim << " ";
+    auto refs = split_tensor_into_batches(output_tensor);
+    for (size_t i = 0; i < refs.size(); i++) {
+        std::string file = "ref_" + std::to_string(i);
+        save_tensor_to_binary_file(refs[i], file);
     }
-    std::cout << std::endl;
 
     if (1 == preprocessed.size()) {
         ov::Tensor resized_source{ov::element::f32, output_tensor.get_shape()};
@@ -429,6 +622,8 @@ EncodedImage llava_image_embed_make_with_bytes_slice(clip_ctx& ctx_clip, const o
             std::copy_n(out + (col * preprocessed.at(1).size() + row + 1) * n_patches * old_hidden_size, n_patches * old_hidden_size, encoded_slices.data<float>() + (col * preprocessed.at(1).size() + row) * n_patches * old_hidden_size);
         }
     }
+
+    save_tensor_to_binary_file(encoded_slices, "encoded_slices_ref.bin");
     return {resized_source, resized_source_size, encoded_slices, tgt_sizes.at(1)};
 }
 
@@ -443,7 +638,8 @@ EncodedImage VisionEncoderMiniCPM::encode(const ov::Tensor& image, const ov::Any
     ctx_clip.image_size = config.image_size;
     std::copy(config.norm_mean.begin(), config.norm_mean.end(), ctx_clip.image_mean);
     std::copy(config.norm_std.begin(), config.norm_std.end(), ctx_clip.image_std);
-    return llava_image_embed_make_with_bytes_slice(ctx_clip, image, encoder, config.max_slice_nums, config.scale_resolution, config.patch_size, 0 == config.max_slice_nums);
+    // return llava_image_embed_make_with_bytes_slice(ctx_clip, image, encoder, config.max_slice_nums, config.scale_resolution, config.patch_size, 0 == config.max_slice_nums);
+    return llava_image_embed_make_with_bytes_slice_iterated(ctx_clip, image, encoder, config.max_slice_nums, config.scale_resolution, config.patch_size, 0 == config.max_slice_nums);
 }
 
 namespace {

@@ -82,7 +82,7 @@ InputsEmbedder::IInputsEmbedder::IInputsEmbedder(
         const std::string& device,
         const ov::AnyMap device_config) :
     m_vlm_config{vlm_config},
-    m_vision_encoder(VisionEncoder::create(model_dir, m_vlm_config.model_type, device, device_config)),
+    m_vision_encoder(VisionEncoder::create(model_dir, m_vlm_config.model_type, "NPU", device_config)),
     m_embedding(EmbeddingsModel::create(model_dir, m_vlm_config.scale_emb, device, device_config)),
     m_tokenizer{model_dir, device_config} { }
 

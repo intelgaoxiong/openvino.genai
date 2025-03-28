@@ -14,15 +14,51 @@
 
 namespace ov::genai {
 
+void convertToStaticShape(std::shared_ptr<ov::Model>& model, size_t patch_size) {
+    int batch_size = 1;
+    int patch_len = 1036;
+
+    std::map<ov::Output<ov::Node>, ov::PartialShape> shapes;
+
+    for (const auto& input : model->inputs()) {
+        auto input_shape = input.get_partial_shape();
+        std::string input_name = input.get_any_name();
+
+        std::cout << "input_name: " << input_name << std::endl;
+
+        if (input_name.find("pixel_values") == 0) {
+            input_shape[0] = batch_size;
+            input_shape[1] = 3;
+            input_shape[2] = patch_size;
+            input_shape[3] = patch_size * patch_len;
+        } else if (input_name.find("patch_attention_mask") == 0) {
+            input_shape[0] = batch_size;
+            input_shape[1] = 1;
+            input_shape[2] = patch_len;
+        } else if (input_name.find("position_ids") == 0) {
+            input_shape[0] = batch_size;
+            input_shape[1] = patch_len;
+        }
+
+        shapes[input] = input_shape;
+    }
+
+    // Reshape the model
+    model->reshape(shapes);
+}
+
 VisionEncoder::VisionEncoder(const std::filesystem::path& model_dir, const std::string& device, const ov::AnyMap properties) {
-    auto compiled_model = utils::singleton_core().compile_model(model_dir / "openvino_vision_embeddings_model.xml", device, properties);
+    std::cout << "Create VisionEncoder on device " << device << " with model " << model_dir / "openvino_vision_embeddings_model.xml" << std::endl;
+    m_processor_config = utils::from_config_json_if_exists<ProcessorConfig>(model_dir, "preprocessor_config.json");
+    auto model = utils::singleton_core().read_model(model_dir / "openvino_vision_embeddings_model.xml");
+    convertToStaticShape(model, m_processor_config.patch_size);
+    auto compiled_model = utils::singleton_core().compile_model(model, device, properties);
     ov::genai::utils::print_compiled_model_properties(compiled_model, "VLM vision embeddings model");
     m_ireq_queue_vision_encoder = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         compiled_model.get_property(ov::optimal_number_of_infer_requests),
         [&compiled_model]() -> ov::InferRequest {
             return compiled_model.create_infer_request();
         });
-    m_processor_config = utils::from_config_json_if_exists<ProcessorConfig>(model_dir, "preprocessor_config.json");
 }
 
 VisionEncoder::VisionEncoder(
