@@ -51,7 +51,25 @@ std::pair<int, int> get_refine_size(std::pair<int, int> original_size, std::pair
     return refine_size;
 }
 
+std::pair<int, int> getMaxSize(int maxSize) {
+    std::pair<int, int> max_grid_size;
+    int maxAreaSize = 1;
+    for (size_t w = 1; w <= maxSize; w ++) {
+        for (size_t h = 1; h <= maxSize; h ++) {
+            auto curr_grid_size = find_best_resize(std::make_pair(w, h), 448, 14, true);
+            auto areaSize = curr_grid_size.first * curr_grid_size.second;
+            if (areaSize > maxAreaSize) {
+                maxAreaSize = areaSize;
+                max_grid_size = curr_grid_size;
+            }
+        }
+    }
+    return max_grid_size;
+}
+
 std::vector<std::vector<clip_image_u8>> slice_image(const clip_image_u8& img, const int max_slice_nums, const int scale_resolution, const int patch_size, const bool never_split) {
+    auto max_grid_size = getMaxSize(1344);
+    printf("@@@@@@@@@@@@@max grid size %d x %d\n", max_grid_size.first, max_grid_size.second);
     const std::pair<int, int> original_size{img.nx, img.ny};
     const int original_width = img.nx;
     const int original_height = img.ny;
@@ -331,6 +349,7 @@ EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip
         std::vector<clip_image_f32> processed_row{row.size()};
         std::transform(row.begin(), row.end(), processed_row.begin(), [&ctx_clip, &max_h, &max_w, &max_size, &n_images](const clip_image_u8& raw) {
             clip_image_f32 im = clip_image_preprocess(ctx_clip, raw);
+            printf("image is %d x %d\n", im.nx, im.ny);
             if (size_t(im.ny) * size_t(im.nx) > max_size) {
                 max_size = size_t(im.ny) * size_t(im.nx);
                 max_h = size_t(im.ny);
