@@ -198,7 +198,11 @@ std::vector<ov::genai::EncodedImage> InputsEmbedder::IInputsEmbedder::encode_ima
             std::cout << dim << " ";
         }
         std::cout << std::endl;
+        auto start_time = std::chrono::steady_clock::now();
         embeds.emplace_back(m_vision_encoder->encode(image));
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        std::cout << "encode_images time: " << duration << " ms" << '\n';
     }
     return embeds;
 }

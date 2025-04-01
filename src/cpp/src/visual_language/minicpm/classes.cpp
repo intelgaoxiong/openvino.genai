@@ -345,15 +345,21 @@ EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip
     printf("Sliced imgs.size() %u\n", imgs.size());
     std::vector<std::vector<clip_image_f32>> preprocessed{imgs.size()};
     size_t max_h = 0, max_w = 0, n_images = 0, max_size = 0;
+    max_size = 14 * (14 * 1376);
+    max_h = 14;
+    max_w = max_size / max_h;
     std::transform(imgs.begin(), imgs.end(), preprocessed.begin(), [&ctx_clip, &max_h, &max_w, &max_size, &n_images](const std::vector<clip_image_u8>& row) {
         std::vector<clip_image_f32> processed_row{row.size()};
         std::transform(row.begin(), row.end(), processed_row.begin(), [&ctx_clip, &max_h, &max_w, &max_size, &n_images](const clip_image_u8& raw) {
             clip_image_f32 im = clip_image_preprocess(ctx_clip, raw);
             printf("image is %d x %d\n", im.nx, im.ny);
             if (size_t(im.ny) * size_t(im.nx) > max_size) {
+#if 0
                 max_size = size_t(im.ny) * size_t(im.nx);
                 max_h = size_t(im.ny);
                 max_w = size_t(im.nx);
+#endif
+                OPENVINO_THROW("Sliced image size is too big");
             }
             ++n_images;
             return im;
@@ -464,6 +470,8 @@ EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip
     ov::Tensor resized_source{ov::element::f32, {1, resized_source_size.height * resized_source_size.width, old_hidden_size}};
     size_t n_patches = tgt_sizes.at(1).height * tgt_sizes.at(1).width;
     ov::Tensor encoded_slices{ov::element::f32, {preprocessed.size() - 1, preprocessed.at(1).size(), n_patches, old_hidden_size}};
+
+    int64_t totalTime = 0;
     for (size_t i = 0; i < preprocessed.size(); i ++) {
         // Set tensors
         encoder.set_tensor("pixel_values", batched_pixel_values[i]);
@@ -486,8 +494,13 @@ EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip
             std::cout << dim << " ";
         }
         std::cout << std::endl;
+
+        auto start_infer = std::chrono::steady_clock::now();
         encoder.start_async();
         encoder.wait();
+        auto end_infer = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_infer - start_infer).count();
+        totalTime += duration;
 
         auto output_tensor = encoder.get_output_tensor();
         if (i == 0) {
@@ -500,6 +513,7 @@ EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip
             }
         }
     }
+    std::cout << "Total infer time for vision embedding: " << totalTime << " ms" << '\n';
 
     // save_tensor_to_binary_file(encoded_slices, "encoded_slices.bin");
     return {resized_source, resized_source_size, encoded_slices, tgt_sizes.at(1)};

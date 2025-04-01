@@ -12,11 +12,13 @@
 #include "visual_language/llava_next/classes.hpp"
 #include "visual_language/internvl_chat/classes.hpp"
 
+#include <fstream>
+
 namespace ov::genai {
 
 void convertToStaticShape(std::shared_ptr<ov::Model>& model, size_t patch_size) {
     int batch_size = 1;
-    int patch_len = 1036;
+    int patch_len = 1376; // should a align to 16 for better infer performance on NPU
 
     std::map<ov::Output<ov::Node>, ov::PartialShape> shapes;
 
@@ -52,7 +54,25 @@ VisionEncoder::VisionEncoder(const std::filesystem::path& model_dir, const std::
     m_processor_config = utils::from_config_json_if_exists<ProcessorConfig>(model_dir, "preprocessor_config.json");
     auto model = utils::singleton_core().read_model(model_dir / "openvino_vision_embeddings_model.xml");
     convertToStaticShape(model, m_processor_config.patch_size);
-    auto compiled_model = utils::singleton_core().compile_model(model, device, properties);
+    std::filesystem::path blob_path("./vit.blob");
+    ov::CompiledModel compiled_model;
+    if (std::filesystem::exists(blob_path)) {
+        std::ifstream fin(blob_path, std::ios::in | std::ios::binary);
+        if (!fin.is_open()) {
+            OPENVINO_THROW("Blob file can't be opened");
+        }
+        std::cout << "Compile VisionEncoder importing compiled model" << std::endl;
+        compiled_model = ov::genai::utils::singleton_core().import_model(fin, "NPU", properties);
+    } else {
+        compiled_model = utils::singleton_core().compile_model(model, device, properties);
+        std::ofstream fout(blob_path, std::ios::out | std::ios::binary);
+        if (!fout.is_open()) {
+            OPENVINO_THROW("Blob file can't be exported");
+        }
+        compiled_model.export_model(fout);
+    }
+    std::cout << "Compile VisionEncoder model done!" << std::endl;
+
     ov::genai::utils::print_compiled_model_properties(compiled_model, "VLM vision embeddings model");
     m_ireq_queue_vision_encoder = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         compiled_model.get_property(ov::optimal_number_of_infer_requests),
