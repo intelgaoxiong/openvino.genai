@@ -439,12 +439,32 @@ EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip
     }
     ov::Tensor position_ids = prepare_vis_position_ids(pixel_values, patch_attention_mask, tgt_sizes, patch_size, ctx_clip.image_size / patch_size);
 
+    // The case where source image does not need split
+    if (1 == preprocessed.size()) {
+        encoder.set_tensor("pixel_values", pixel_values);
+        encoder.set_tensor("patch_attention_mask", patch_attention_mask);
+        encoder.set_tensor("position_ids", position_ids);
+
+        encoder.start_async();
+        encoder.wait();
+
+        auto output_tensor = encoder.get_output_tensor();
+
+        ov::Tensor resized_source{ov::element::f32, output_tensor.get_shape()};
+        output_tensor.copy_to(resized_source);
+        return {std::move(resized_source), resized_source_size};
+    }
+
+    // The case where source image needs to be split
     auto batched_pixel_values = split_tensor_into_batches(pixel_values);
     auto batched_patch_attention_mask = split_tensor_into_batches(patch_attention_mask);
     auto batched_position_ids = split_tensor_into_batches(position_ids);
 
-    std::vector<ov::Tensor> output_tensors;
-    for (size_t i = 0; i < n_images; i ++) {
+    size_t old_hidden_size = encoder.get_output_tensor().get_shape().at(2);
+    ov::Tensor resized_source{ov::element::f32, {1, resized_source_size.height * resized_source_size.width, old_hidden_size}};
+    size_t n_patches = tgt_sizes.at(1).height * tgt_sizes.at(1).width;
+    ov::Tensor encoded_slices{ov::element::f32, {preprocessed.size() - 1, preprocessed.at(1).size(), n_patches, old_hidden_size}};
+    for (size_t i = 0; i < preprocessed.size(); i ++) {
         // Set tensors
         encoder.set_tensor("pixel_values", batched_pixel_values[i]);
         std::cout << "pixel_values tensor dimensions: ";
@@ -470,48 +490,18 @@ EncodedImage llava_image_embed_make_with_bytes_slice_iterated(clip_ctx& ctx_clip
         encoder.wait();
 
         auto output_tensor = encoder.get_output_tensor();
-        ov::Tensor tmpTensor{ov::element::f32, output_tensor.get_shape()};
-        output_tensor.copy_to(tmpTensor);
-
-        std::string file_name = "out_" + std::to_string(i);
-        save_tensor_to_binary_file(tmpTensor, file_name);
-
-        output_tensors.push_back(tmpTensor);
-    }
-
-    std::cout << "visual output_tensor dimensions: ";
-    for (const auto& dim : output_tensors[0].get_shape()) {
-        std::cout << dim << " ";
-    }
-    std::cout << std::endl;
-
-    if (1 == output_tensors.size()) {
-        ov::Tensor resized_source{ov::element::f32, output_tensors[0].get_shape()};
-        output_tensors[0].copy_to(resized_source);
-        return {std::move(resized_source), resized_source_size};
-    }
-
-    size_t old_hidden_size = output_tensors[0].get_shape().at(2);
-    const float* out = output_tensors[0].data<float>();
-    ov::Tensor resized_source{ov::element::f32, {1, resized_source_size.height * resized_source_size.width, old_hidden_size}};
-    std::copy_n(out, resized_source.get_size(), resized_source.data<float>());
-
-    std::cout << "preprocessed.size() " << preprocessed.size() << std::endl;
-    for (size_t i = 0; i < preprocessed.size(); i ++) {
-        std::cout << i << " " << preprocessed.at(1).size() << std::endl;
-    }
-    size_t n_patches = tgt_sizes.at(1).height * tgt_sizes.at(1).width;
-    ov::Tensor encoded_slices{ov::element::f32, {preprocessed.size() - 1, preprocessed.at(1).size(), n_patches, old_hidden_size}};
-    for (size_t col = 0; col < preprocessed.size() - 1; ++col) {
-        for (size_t row = 0; row < preprocessed.at(1).size(); ++row) {
-            float* currOut = output_tensors[col + 1].data<float>();
-            std::cout << "id " << col + 1 << std::endl;
-            std::cout << "1 copy " << n_patches * old_hidden_size << std::endl;
-            std::copy_n(currOut, n_patches * old_hidden_size, encoded_slices.data<float>() + (col * preprocessed.at(1).size() + row) * n_patches * old_hidden_size);
+        if (i == 0) {
+            const float* out = output_tensor.data<float>();
+            std::copy_n(out, resized_source.get_size(), resized_source.data<float>());
+        } else {
+            for (size_t row = 0; row < preprocessed.at(1).size(); ++row) {
+                float* currOut = output_tensor.data<float>();
+                std::copy_n(currOut, n_patches * old_hidden_size, encoded_slices.data<float>() + ((i - 1) * preprocessed.at(1).size() + row) * n_patches * old_hidden_size);
+            }
         }
     }
 
-    save_tensor_to_binary_file(encoded_slices, "encoded_slices.bin");
+    // save_tensor_to_binary_file(encoded_slices, "encoded_slices.bin");
     return {resized_source, resized_source_size, encoded_slices, tgt_sizes.at(1)};
 }
 
@@ -837,7 +827,7 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
     );
 
     std::cout << "prompt: " << prompt << std::endl;
-    std::cout << "unified_prompt: " << unified_prompt << std::endl;
+    // std::cout << "unified_prompt: " << unified_prompt << std::endl;
 
     std::string unk64;
     for (size_t idx = 0; idx < m_vlm_config.query_num; ++idx) {
@@ -864,7 +854,7 @@ ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& prompt, c
         unified_prompt.replace(unified_prompt.find(NATIVE_TAG), NATIVE_TAG.length(), expanded_tag);
     }
 
-    std::cout << "unified_prompt2: " << unified_prompt << std::endl;
+    // std::cout << "unified_prompt2: " << unified_prompt << std::endl;
 
     m_image_id = images_sequence.empty() ? m_image_id : *std::max_element(images_sequence.begin(), images_sequence.end()) + 1;
 
